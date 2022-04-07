@@ -5,6 +5,7 @@ from   scipy import stats
 from   sklearn.neighbors import KernelDensity
 from   sklearn.model_selection import GridSearchCV
 from   sklearn.covariance import EmpiricalCovariance
+import warnings
 
 
 def weighted_mean(x, w):
@@ -107,7 +108,7 @@ def get_bw(samples, num_max=1000):
     return grid.best_params_["bandwidth"]
 
 
-def generate_synthetic_samples(samples, bandwidths, n_up):
+def generate_synthetic_samples(samples, bandwidths, n_up, weights=None):
     """
     Use PDF Over-Sampling (PDFOS - Gao+ 2014) to generate synthetic samples
     
@@ -119,6 +120,8 @@ def generate_synthetic_samples(samples, bandwidths, n_up):
         pre-estimated KDE bandwidths for each of M parameters
     n_up : int
         number of upsampled synthetic data points to generate
+    weights : ndarray, (N x M)
+        array of weights corresponding to samples
         
     Returns
     -------
@@ -126,23 +129,90 @@ def generate_synthetic_samples(samples, bandwidths, n_up):
         array containing synthetic samples
     """
     n_samp, n_dim = samples.shape
+    index = np.arange(0, n_samp, dtype='int')
     
+    # we'll generate a few more samples than needed in anticipation of rejecting a few
+    n_up101 = int(1.01*n_up)
+
+    # naive resampling (used only to estimate covariance matrix)
+    naive_resamples = samples[np.random.choice(index, p=weights, size=3*n_samp)]
+
     # compute empirical covariance matrix and lower Cholesky decomposition
-    emp_cov = EmpiricalCovariance().fit(samples).covariance_
+    emp_cov = EmpiricalCovariance().fit(naive_resamples).covariance_
     L = np.linalg.cholesky(emp_cov)
 
-    # scale each parameter by precompputed bandwidths so they have similar variance
+    # scale each parameter by precomputed bandwidths so they have similar variance
     samples_scaled = (samples - np.mean(samples, axis=0)) / bandwidths
 
     # calculate synthetic samples following PDFOS (Gao+ 2014)
-    random_index = np.random.randint(0, n_samp, n_up)
+    random_index = np.random.choice(index, p=weights, size=n_up101)
     random_samples = samples_scaled[random_index]
-    random_weights = np.random.normal(0, 1, n_up*n_dim).reshape(n_up, n_dim)
-    new_samples = random_samples + np.dot(L.T, random_weights.T).T
+    random_jitter = np.random.normal(0, 1, n_up101*n_dim).reshape(n_up101, n_dim)
+    new_samples = random_samples + np.dot(L.T, random_jitter.T).T
 
     # rescale each parameter to invert previous scaling
-    return new_samples*bandwidths + np.mean(samples, axis=0)
+    new_samples = new_samples*bandwidths + np.mean(samples, axis=0)
+    
+    # reject any synthetic samples pushed out of bounds of original samples
+    bad = np.zeros(n_up101, dtype='bool')
+    
+    for i in range(n_dim):
+        bad += (new_samples[:,i] < samples[:,i].min())
+        bad += (new_samples[:,i] > samples[:,i].max())
+        
+    if np.sum(bad)/len(bad) > 0.01:
+        warnings.warn("More than 1% of PDFOS generated samples were beyond min/max values of original samples")
+    
+    new_samples = new_samples[~bad]
+    
+    # only return n_up samples
+    if new_samples.shape[0] >= n_up:
+        return new_samples[:n_up]
+    
+    else:
+        # use naive resampling to replace rejected samples
+        replacement_samples = samples[np.random.choice(index, p=weights, size=n_up-new_samples.shape[0])]
+    
+        return np.vstack([new_samples, replacement_samples])
 
+
+
+def imp_sample(rho_tilde, rho_star, norm=True, return_log=False):
+    '''
+    Perform standard importance sampling from rho_tilde --> {e, omega}
+    
+    Args
+    ----
+    rho_tilde : [array] length-N array of sampled data for pseudo-density rho_tilde
+    rho_star : [tuple] values of the true stellar density and its uncertainty
+    norm : [bool] True to normalize weights before output (default=True)
+    return_log :  [bool] True to return ln(weights) instead of weights (default=False)
+    
+    Output:
+    weights [array]: importance sampling weights
+    ecc [array]: random values drawn uniformly from 0 to 1, with array length = len(rho_array)
+    omega [array]:random values drawn uniformly from -pi/2 to 3pi/2, with array length = len(rho_array)
+    '''
+    ecc = np.random.uniform(0., 1., len(rho_tilde))
+    omega = np.random.uniform(-0.5*np.pi, 1.5*np.pi, len(rho_tilde))
+
+    g = (1 + ecc * np.sin(omega)) / np.sqrt(1 - ecc ** 2)
+    rho = rho_tilde / g ** 3
+
+    log_weights = -0.5 * ((rho - rho_star[0]) / rho_star[1]) ** 2
+    
+    if return_log:
+        return log_weights, ecc, omega
+    
+    else:
+        weights = np.exp(log_weights - np.max(log_weights))
+
+        if norm:
+            weights /= np.sum(weights)
+    
+        return weights, ecc, omega
+    
+    
 
 def boxcar_smooth(x, winsize, passes=2):
     """
